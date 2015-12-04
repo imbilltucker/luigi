@@ -23,28 +23,30 @@ class SimpleTask(luigi.Task):
     def run(self):
         print self.x * self.y
 
-    @luigi.Task.event_handler(luigi.Event.SUCCESS)
-    def celebrate_success(self):
-        """
-        Report success event
-        Uses "-+--+--+--+--+--+--+--+--+--+-" as indicator
-        """
 
-        print(26 * '-+-')
-        print("Yay!, {c} succeeded. :)".format(c=self.__class__.__name__))
-        print(26 * '-+-')
+@SimpleTask.event_handler(luigi.Event.SUCCESS)
+def celebrate_success(self):
+    """
+    Report success event
+    Uses "-+--+--+--+--+--+--+--+--+--+-" as indicator
+    """
 
-    @luigi.Task.event_handler(luigi.Event.FAILURE)
-    def mourn_failure(self, exception):
-        """
-        Report failure event
-        Uses "-!--!--!--!--!--!--!--!--!--!-"  as indicator
-        """
+    print(26 * '-+-')
+    print("Yay!, {c} succeeded. :)".format(c=self.__class__.__name__))
+    print(26 * '-+-')
 
-        print(26 * '-!-')
-        print("Boo!, {c} failed.  :(".format(c=self.__class__.__name__))
-        print(".. with this exception: '{e}'".format(e=str(exception)))
-        print(26 * '-!-')
+
+@ComplexTask.event_handler(luigi.Event.FAILURE)
+def mourn_failure(self, exception):
+    """
+    Report failure event
+    Uses "-!--!--!--!--!--!--!--!--!--!-"  as indicator
+    """
+
+    print(26 * '-!-')
+    print("Boo!, {c} failed.  :(".format(c=self.__class__.__name__))
+    print(".. with this exception: '{e}'".format(e=str(exception)))
+    print(26 * '-!-')
 
 
 def main():
@@ -55,8 +57,5 @@ def main():
     luigi.run()
 
 
-
-
 if __name__ == "__main__":
     main()
-
