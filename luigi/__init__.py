@@ -29,14 +29,13 @@ from luigi.file import File, LocalTarget
 
 from luigi import rpc
 from luigi.rpc import RemoteScheduler, RPCError
-
 from luigi import parameter
 from luigi.parameter import (
     Parameter,
     DateParameter, MonthParameter, YearParameter, DateHourParameter, DateMinuteParameter,
     DateIntervalParameter, TimeDeltaParameter,
     IntParameter, FloatParameter, BooleanParameter, BoolParameter,
-    TaskParameter,
+    TaskParameter, EnumParameter, DictParameter
 )
 
 from luigi import configuration
@@ -57,5 +56,6 @@ __all__ = [
     'YearParameter', 'DateHourParameter', 'DateMinuteParameter', 'range',
     'DateIntervalParameter', 'TimeDeltaParameter', 'IntParameter',
     'FloatParameter', 'BooleanParameter', 'BoolParameter', 'TaskParameter',
-    'configuration', 'interface', 'file', 'run', 'build', 'event', 'Event'
+    'EnumParameter', 'DictParameter', 'configuration', 'interface', 'file', 'run', 'build',
+    'event', 'Event'
 ]

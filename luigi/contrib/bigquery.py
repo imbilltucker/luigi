@@ -19,7 +19,6 @@ import collections
 import logging
 import luigi.target
 import time
-import random
 
 logger = logging.getLogger('luigi-interface')
 
@@ -217,6 +216,59 @@ class BigqueryClient(object):
 
             response = request.execute()
 
+    def get_view(self, table):
+        """Returns the SQL query for a view, or None if it doesn't exist or is not a view.
+
+        :param table: The table containing the view.
+        :type table: BQTable
+        """
+
+        request = self.client.tables().get(projectId=table.project_id,
+                                           datasetId=table.dataset_id,
+                                           tableId=table.table_id)
+
+        try:
+            response = request.execute()
+        except http.HttpError as ex:
+            if ex.resp.status == 404:
+                return None
+            raise
+
+        return response['view']['query'] if 'view' in response else None
+
+    def update_view(self, table, view):
+        """Updates the SQL query for a view.
+
+        If the output table exists, it is replaced with the supplied view query. Otherwise a new
+        table is created with this view.
+
+        :param table: The table to contain the view.
+        :type table: BQTable
+        :param view: The SQL query for the view.
+        :type view: str
+        """
+
+        body = {
+            'tableReference': {
+                'projectId': table.project_id,
+                'datasetId': table.dataset_id,
+                'tableId': table.table_id
+            },
+            'view': {
+                'query': view
+            }
+        }
+
+        if self.table_exists(table):
+            self.client.tables().update(projectId=table.project_id,
+                                        datasetId=table.dataset_id,
+                                        tableId=table.table_id,
+                                        body=body).execute()
+        else:
+            self.client.tables().insert(projectId=table.project_id,
+                                        datasetId=table.dataset_id,
+                                        body=body).execute()
+
     def run_job(self, project_id, body, dataset=None):
         """Runs a bigquery "job". See the documentation for the format of body.
 
@@ -284,10 +336,8 @@ class BigqueryClient(object):
 
 
 class BigqueryTarget(luigi.target.Target):
-    def __init__(self, project_id, dataset_id, table_id, client=None, tmp_dataset_id=None):
+    def __init__(self, project_id, dataset_id, table_id, client=None):
         self.table = BQTable(project_id=project_id, dataset_id=dataset_id, table_id=table_id)
-        tmp_table_id = "_" + table_id + "_%09d" % random.randrange(0, 1e10)
-        self.tmp_table = BQTable(project_id=project_id, dataset_id=tmp_dataset_id or "_incoming", table_id=tmp_table_id)
         self.client = client or BigqueryClient()
 
     @classmethod
@@ -329,13 +379,13 @@ class MixinBigqueryBulkComplete(object):
 
         # Query the available tables for all datasets
         client = tasks_with_params[0][0].output().client
-
-        available = {dataset: set(client.list_tables(dataset)) for dataset in datasets}
+        available_datasets = filter(client.dataset_exists, datasets)
+        available_tables = {d: set(client.list_tables(d)) for d in available_datasets}
 
         # Return parameter_tuples belonging to available tables
         for t, p in tasks_with_params:
             table = t.output().table
-            if table.table_id in available.get(table.dataset, []):
+            if table.table_id in available_tables.get(table.dataset, []):
                 yield p
 
 
@@ -384,9 +434,9 @@ class BigqueryLoadTask(MixinBigqueryBulkComplete, luigi.Task):
             'configuration': {
                 'load': {
                     'destinationTable': {
-                        'projectId': output.tmp_table.project_id,
-                        'datasetId': output.tmp_table.dataset_id,
-                        'tableId': output.tmp_table.table_id,
+                        'projectId': output.table.project_id,
+                        'datasetId': output.table.dataset_id,
+                        'tableId': output.table.table_id,
                     },
                     'sourceFormat': self.source_format,
                     'writeDisposition': self.write_disposition,
@@ -398,14 +448,7 @@ class BigqueryLoadTask(MixinBigqueryBulkComplete, luigi.Task):
         if self.schema:
             job['configuration']['load']['schema'] = {'fields': self.schema}
 
-        logger.info('Loading data to temporary table %s.%s', output.tmp_table.dataset_id, output.tmp_table.table_id)
-        bq_client.run_job(output.tmp_table.project_id, job, dataset=output.tmp_table.dataset)
-        logger.info('Moving temporary table %s.%s to destination table %s.%s',
-                    output.tmp_table.dataset_id, output.tmp_table.table_id,
-                    output.table.dataset_id, output.table.table_id)
-        bq_client.copy(output.tmp_table, output.table)
-        logger.info('Removing temporary table %s.%s', output.tmp_table.dataset_id, output.tmp_table.table_id)
-        bq_client.delete_table(output.tmp_table)
+        bq_client.run_job(output.table.project_id, job, dataset=output.table.dataset)
 
 
 class BigqueryRunQueryTask(MixinBigqueryBulkComplete, luigi.Task):
@@ -421,6 +464,12 @@ class BigqueryRunQueryTask(MixinBigqueryBulkComplete, luigi.Task):
     def create_disposition(self):
         """Whether to create the table or not. See :py:class:`CreateDisposition`"""
         return CreateDisposition.CREATE_IF_NEEDED
+
+    @property
+    def flatten_results(self):
+        """Flattens all nested and repeated fields in the query results.
+        allowLargeResults must be true if this is set to False."""
+        return True
 
     @property
     def query(self):
@@ -459,8 +508,55 @@ class BigqueryRunQueryTask(MixinBigqueryBulkComplete, luigi.Task):
                     'allowLargeResults': True,
                     'createDisposition': self.create_disposition,
                     'writeDisposition': self.write_disposition,
+                    'flattenResults': self.flatten_results
                 }
             }
         }
 
         bq_client.run_job(output.table.project_id, job, dataset=output.table.dataset)
+
+
+class BigqueryCreateViewTask(luigi.Task):
+    """
+    Creates (or updates) a view in BigQuery.
+
+    The output of this task needs to be a BigQueryTarget.
+    Instances of this class should specify the view SQL in the view property.
+
+    If a view already exist in BigQuery at output(), it will be updated.
+    """
+
+    @property
+    def view(self):
+        """The SQL query for the view, in text form."""
+        raise NotImplementedError()
+
+    def complete(self):
+        output = self.output()
+        assert isinstance(output, BigqueryTarget), 'Output must be a bigquery target, not %s' % (output)
+
+        if not output.exists():
+            return False
+
+        existing_view = output.client.get_view(output.table)
+        return existing_view == self.view
+
+    def run(self):
+        output = self.output()
+        assert isinstance(output, BigqueryTarget), 'Output must be a bigquery target, not %s' % (output)
+
+        view = self.view
+        assert view, 'No view was provided'
+
+        logger.info('Create view')
+        logger.info('Destination: %s', output)
+        logger.info('View SQL: %s', view)
+
+        output.client.update_view(output.table, view)
+
+
+class ExternalBigqueryTask(MixinBigqueryBulkComplete, luigi.ExternalTask):
+    """
+    An external task for a BigQuery target.
+    """
+    pass

@@ -17,7 +17,7 @@
 .. image:: https://img.shields.io/pypi/l/luigi.svg?style=flat
    :target: https://pypi.python.org/pypi/luigi
 
-Luigi is a Python (2.7, 3.3, 3.4) package that helps you build complex pipelines of batch
+Luigi is a Python (2.7, 3.3, 3.4, 3.5) package that helps you build complex pipelines of batch
 jobs. It handles dependency resolution, workflow management, visualization,
 handling failures, command line integration, and much more.
 
@@ -137,6 +137,10 @@ or held presentations about Luigi:
 * `Treasure Data <http://blog.treasuredata.com/blog/2015/02/25/managing-the-data-pipeline-with-git-luigi/>`_
 * `Growth Intelligence <http://www.slideshare.net/growthintel/a-beginners-guide-to-building-data-pipelines-with-luigi>`_
 * `AdRoll <http://tech.adroll.com/blog/data/2015/09/22/data-pipelines-docker.html>`_
+* `Schibsted <http://www.schibsted.com/>`_
+* `17zuoye <https://speakerdeck.com/mvj3/luiti-an-offline-task-management-framework>`_
+* `enbrite.ly <http://enbrite.ly/>`_
+* `Dow Jones / The Wall Street Journal <http://wsj.com>`_
 
 We're more than happy to have your company added here. Just send a PR on GitHub.
 

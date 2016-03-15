@@ -72,7 +72,7 @@ Running this Locally
 
 Try running this using eg.
 
-::
+.. code-block:: console
 
     $ cd examples
     $ luigi --module top_artists AggregateArtists --local-scheduler --date-interval 2012-06
@@ -120,7 +120,8 @@ here is how this could look like, instead of the class above.
 Note that :class:`luigi.contrib.hadoop.JobTask` doesn't require you to implement a
 :func:`~luigi.task.Task.run` method. Instead, you typically implement a
 :func:`~luigi.contrib.hadoop.JobTask.mapper` and
-:func:`~luigi.contrib.hadoop.JobTask.reducer` method.
+:func:`~luigi.contrib.hadoop.JobTask.reducer` method. *mapper* and *combiner* require
+yielding tuple of only two elements: key and value. Both key and value also may be a tuple.
 
 Step 2 – Find the Top Artists
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -165,7 +166,7 @@ defines a dependency on the previous task (*AggregateArtists*).
 This means that if the output of *AggregateArtists* does not exist,
 the task will run before *Top10Artists*.
 
-::
+.. code-block:: console
 
     $ luigi --module examples.top_artists Top10Artists --local-scheduler --date-interval 2012-07
 
@@ -219,9 +220,9 @@ your script will try to connect to the central planner,
 by default at localhost port 8082.
 If you run
 
-::
+.. code-block:: console
 
-    luigid
+    $ luigid
 
 in the background and then run your task without the ``--local-scheduler`` flag,
 then your script will now schedule through a centralized server.

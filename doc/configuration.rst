@@ -13,15 +13,16 @@ in increasing order of preference. The order only matters in case of key conflic
 
 The config file is broken into sections, each controlling a different part of the config. Example configuration file:
 
-::
+
+.. code:: ini
 
     [hadoop]
-    version: cdh4
-    streaming-jar: /usr/lib/hadoop-xyz/hadoop-streaming-xyz-123.jar
+    version=cdh4
+    streaming-jar=/usr/lib/hadoop-xyz/hadoop-streaming-xyz-123.jar
 
     [core]
-    default-scheduler-host: luigi-host.mycompany.foo
-    error-email: foo@bar.baz
+    default-scheduler-host=luigi-host.mycompany.foo
+    error-email=foo@bar.baz
 
 
 .. _ParamConfigIngestion:
@@ -41,10 +42,10 @@ have a Task definition:
 Then you can override the default value for ``DailyReport().date`` by providing
 it in the configuration:
 
-::
+.. code:: ini
 
     [DailyReport]
-    date: 2012-01-01
+    date=2012-01-01
 
 .. _ConfigClasses:
 
@@ -54,11 +55,11 @@ Configuration classes
 Using the :ref:`ParamConfigIngestion` method. We derive the
 conventional way to do global configuration. Imagine this configuration.
 
-::
+.. code:: ini
 
     [mysection]
-    option: hello
-    intoption: 123
+    option=hello
+    intoption=123
 
 
 We can create a :py:class:`~luigi.Config` class:
@@ -177,20 +178,6 @@ parallel-scheduling
   parallel using multiprocessing. This can significantly speed up
   scheduling, but requires that all tasks can be pickled.
 
-retry-external-tasks
-  If true, incomplete external tasks (i.e. tasks where the `run()` method is
-  NotImplemented) will be retested for completion while Luigi is running.
-  This means that if external dependencies are satisfied after a workflow has
-  started, any tasks dependent on that resource will be eligible for running.
-  Note: Every time the task remains incomplete, it will count as FAILED, so
-  normal retry logic applies (see: `disable-num-failures` and `retry-delay`).
-  This setting works best with `worker-keep-alive: true`.
-  If false, external tasks will only be evaluated when Luigi is first invoked.
-  In this case, Luigi will not check whether external dependencies are
-  satisfied  while a workflow is in progress, so dependent tasks will remain
-  PENDING until the workflow is reinvoked.
-  Defaults to false for backwards compatibility.
-
 rpc-connect-timeout
   Number of seconds to wait before timing out when making an API call.
   Defaults to 10.0
@@ -215,27 +202,35 @@ smtp_port
 smtp_ssl
   If true, connects to smtp through SSL. Defaults to false.
 
+smtp_without_tls
+  If true, connects to smtp without TLS. Defaults to false.
+
 smtp_timeout
   Optionally sets the number of seconds after which smtp attempts should
   time out.
 
-worker-count-uniques
+
+[worker]
+
+These parameters control Luigi worker behavior.
+
+count_uniques
   If true, workers will only count unique pending jobs when deciding
   whether to stay alive. So if a worker can't get a job to run and other
   workers are waiting on all of its pending jobs, the worker will die.
   worker-keep-alive must be true for this to have any effect. Defaults
   to false.
 
-worker-keep-alive
+keep_alive
   If true, workers will stay alive when they run out of jobs to run, as
   long as they have some pending job waiting to be run. Defaults to
   false.
 
-worker-ping-interval
+ping_interval
   Number of seconds to wait between pinging scheduler to let it know
   that the worker is still alive. Defaults to 1.0.
 
-worker-task-limit
+task_limit
   .. versionadded:: 1.0.25
 
   Maximum number of tasks to schedule per invocation. Upon exceeding it,
@@ -243,7 +238,7 @@ worker-task-limit
   thus far. Prevents incidents due to spamming of the scheduler, usually
   accidental. Default: no limit.
 
-worker-timeout
+timeout
   .. versionadded:: 1.0.20
 
   Number of seconds after which to kill a task which has been running
@@ -253,15 +248,46 @@ worker-timeout
   by killing worker subprocesses. Default value is 0, meaning no
   timeout.
 
-worker-wait-interval
+wait_interval
   Number of seconds for the worker to wait before asking the scheduler
   for another job after the scheduler has said that it does not have any
   available jobs.
 
-worker-wait-jitter
+wait_jitter
   Size of jitter to add to the worker wait interval such that the multiple
   workers do not ask the scheduler for another job at the same time.
   Default: 5.0
+
+max_reschedules
+  Maximum number of times to reschedule a failed task.
+  Default: 1
+
+retry_external_tasks
+  If true, incomplete external tasks (i.e. tasks where the `run()` method is
+  NotImplemented) will be retested for completion while Luigi is running.
+  This means that if external dependencies are satisfied after a workflow has
+  started, any tasks dependent on that resource will be eligible for running.
+  Note: Every time the task remains incomplete, it will count as FAILED, so
+  normal retry logic applies (see: `disable-num-failures` and `retry-delay`).
+  This setting works best with `worker-keep-alive: true`.
+  If false, external tasks will only be evaluated when Luigi is first invoked.
+  In this case, Luigi will not check whether external dependencies are
+  satisfied  while a workflow is in progress, so dependent tasks will remain
+  PENDING until the workflow is reinvoked.
+  Defaults to false for backwards compatibility.
+
+
+[worker]
+
+no_install_shutdown_handler
+  By default, workers will stop requesting new work and finish running
+  pending tasks after receiving a `SIGUSR1` signal. This provides a hook
+  for gracefully shutting down workers that are in the process of running
+  (potentially expensive) tasks. If set to true, Luigi will NOT install
+  this shutdown hook on workers. Note this hook does not work on Windows
+  operating systems, or when jobs are launched outside the main execution
+  thread.
+  Defaults to false.
 
 
 [elasticsearch]
@@ -332,9 +358,11 @@ Parameters controlling the use of snakebite to speed up hdfs queries.
 
 client
   Client to use for most hadoop commands. Options are "snakebite",
-  "snakebite_with_hadoopcli_fallback", and "hadoopcli". Snakebite is
-  much faster, so use of it is encouraged. Using snakebite requires it
-  to be installed separately on the machine. Defaults to "hadoopcli".
+  "snakebite_with_hadoopcli_fallback", "webhdfs" and "hadoopcli". Snakebite is
+  much faster, so use of it is encouraged. webhdfs is fast and works with
+  Python 3 as well, but has not been used that much in the wild.
+  Both snakebite and webhdfs requires you to install it separately on
+  the machine. Defaults to "hadoopcli".
 
 client_version
   Optionally specifies hadoop client version for snakebite.
@@ -353,7 +381,7 @@ namenode_port
 snakebite_autoconfig
   If true, attempts to automatically detect the host and port of the
   namenode for snakebite queries. Defaults to false.
-  
+
 tmp_dir
   Path to where luigi will put temporary files on hdfs
 
@@ -426,11 +454,11 @@ exceeding the counts in this section. Unspecified resources are assumed
 to have limit 1. Example resources section for a configuration with 2
 hive resources and 1 mysql resource:
 
-::
+.. code:: ini
 
   [resources]
-  hive: 2
-  mysql: 1
+  hive=2
+  mysql=1
 
 Note that it was not necessary to specify the 1 for mysql here, but it
 is good practice to do so when you have a fixed set of resources.
@@ -446,15 +474,15 @@ codes that could apply, for example a failing task and missing data, the
 
 We recommend that you copy this set of exit codes to your ``luigi.cfg`` file:
 
-::
+.. code:: ini
 
   [retcode]
   # The following return codes are the recommended exit codes for luigi
   # They are in increasing level of severity (for most applications)
-  already_running: 10
-  missing_data: 20
-  task_failed: 30
-  unhandled_exception: 40
+  already_running=10
+  missing_data=20
+  task_failed=30
+  unhandled_exception=40
 
 unhandled_exception
   For exceptions during scheduling (if you raise from the ``complete()`` or
@@ -681,3 +709,15 @@ Parameters controlling execution summary of a worker
 summary-length
   Maximum number of tasks to show in an execution summary.  If the value is 0,
   then all tasks will be displayed.  Default value is 5.
+
+
+[webhdfs]
+---------
+
+port
+  The port to use for webhdfs. The normal namenode port is probably on a
+  different port from this one.
+user
+  Perform file system operations as the specified user instead of $USER.  Since
+  this parameter is not honored by any of the other hdfs clients, you should
+  think twice before setting this parameter.

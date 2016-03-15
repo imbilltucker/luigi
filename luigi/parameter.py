@@ -23,6 +23,12 @@ See :ref:`Parameter` for more info on how to define parameters.
 import abc
 import datetime
 import warnings
+import json
+from json import JSONEncoder
+from collections import OrderedDict, Mapping
+import operator
+import functools
+
 try:
     from ConfigParser import NoOptionError, NoSectionError
 except ImportError:
@@ -30,10 +36,9 @@ except ImportError:
 
 from luigi import task_register
 from luigi import six
-
 from luigi import configuration
-from datetime import timedelta
 from luigi.cmdline_parser import CmdlineParser
+
 
 _no_value = object()
 
@@ -129,9 +134,8 @@ class Parameter(object):
                                  default value for this parameter. DEPRECATED.
                                  Default: ``None``.
         :param bool positional: If true, you can set the argument as a
-                                positional argument. Generally we recommend ``positional=False``
-                                as positional arguments become very tricky when
-                                you have inheritance and whatnot.
+                                positional argument. It's true by default but we recommend
+                                ``positional=False`` for abstract base classes and similar cases.
         :param bool always_in_help: For the --help option in the command line
                                     parsing. Set true to always show in --help.
         """
@@ -203,7 +207,7 @@ class Parameter(object):
         if value == _no_value:
             raise MissingParameterException("No default specified")
         else:
-            return value
+            return self.normalize(value)
 
     def parse(self, x):
         """
@@ -227,8 +231,21 @@ class Parameter(object):
         """
         return str(x)
 
-    @classmethod
-    def next_in_enumeration(_cls, _value):
+    def normalize(self, x):
+        """
+        Given a parsed parameter value, normalizes it.
+
+        The value can either be the result of parse(), the default value or
+        arguments passed into the task's constructor by instantiation.
+
+        This is very implementation defined, but can be used to validate/clamp
+        valid values. For example, if you wanted to only accept even integers,
+        and "correct" odd values to the nearest integer, you can implement
+        normalize as ``x // 2 * 2``.
+        """
+        return x  # default impl
+
+    def next_in_enumeration(self, _value):
         """
         If your Parameter type has an enumerable ordering of values. You can
         choose to override this method. This method is used by the
@@ -256,11 +273,19 @@ class Parameter(object):
         return "store"
 
 
+_UNIX_EPOCH = datetime.datetime.utcfromtimestamp(0)
+
+
 class _DateParameterBase(Parameter):
     """
-    Base class Parameter for dates. Code reuse is made possible since all date
-    parameters are serialized in the same way.
+    Base class Parameter for date (not datetime).
     """
+
+    def __init__(self, interval=1, start=None, **kwargs):
+        super(_DateParameterBase, self).__init__(**kwargs)
+        self.interval = interval
+        self.start = start if start is not None else _UNIX_EPOCH.date()
+
     @abc.abstractproperty
     def date_format(self):
         """
@@ -268,13 +293,11 @@ class _DateParameterBase(Parameter):
         """
         pass
 
-    @abc.abstractproperty
-    def _timedelta(self):
+    def parse(self, s):
         """
-        Either override me with a :py:class:`~datetime.timedelta` value or
-        implement :py:meth:`~Parameter.next_in_enumeration` to return ``None``.
+        Parses a date string formatted like ``YYYY-MM-DD``.
         """
-        pass
+        return datetime.datetime.strptime(s, self.date_format).date()
 
     def serialize(self, dt):
         """
@@ -283,10 +306,6 @@ class _DateParameterBase(Parameter):
         if dt is None:
             return str(dt)
         return dt.strftime(self.date_format)
-
-    @classmethod
-    def next_in_enumeration(cls, value):
-        return value + cls._timedelta
 
 
 class DateParameter(_DateParameterBase):
@@ -298,13 +317,19 @@ class DateParameter(_DateParameterBase):
     """
 
     date_format = '%Y-%m-%d'
-    _timedelta = timedelta(days=1)
 
-    def parse(self, s):
-        """
-        Parses a date string formatted as ``YYYY-MM-DD``.
-        """
-        return datetime.datetime.strptime(s, self.date_format).date()
+    def next_in_enumeration(self, value):
+        return value + datetime.timedelta(days=self.interval)
+
+    def normalize(self, value):
+        if value is None:
+            return None
+
+        if isinstance(value, datetime.datetime):
+            value = value.date()
+
+        delta = (value - self.start).days % self.interval
+        return value - datetime.timedelta(days=delta)
 
 
 class MonthParameter(DateParameter):
@@ -318,9 +343,29 @@ class MonthParameter(DateParameter):
 
     date_format = '%Y-%m'
 
-    @staticmethod
-    def next_in_enumeration(_value):
-        return None
+    def _add_months(self, date, months):
+        """
+        Add ``months`` months to ``date``.
+
+        Unfortunately we can't use timedeltas to add months because timedelta counts in days
+        and there's no foolproof way to add N months in days without counting the number of
+        days per month.
+        """
+        year = date.year + (date.month + months - 1) // 12
+        month = (date.month + months - 1) % 12 + 1
+        return datetime.date(year=year, month=month, day=1)
+
+    def next_in_enumeration(self, value):
+        return self._add_months(value, self.interval)
+
+    def normalize(self, value):
+        if value is None:
+            return None
+
+        months_since_start = (value.year - self.start.year) * 12 + (value.month - self.start.month)
+        months_since_start -= months_since_start % self.interval
+
+        return self._add_months(self.start, months_since_start)
 
 
 class YearParameter(DateParameter):
@@ -333,12 +378,73 @@ class YearParameter(DateParameter):
 
     date_format = '%Y'
 
-    @staticmethod
-    def next_in_enumeration(_value):
-        return None
+    def next_in_enumeration(self, value):
+        return value.replace(year=value.year + self.interval)
+
+    def normalize(self, value):
+        if value is None:
+            return None
+
+        delta = (value.year - self.start.year) % self.interval
+        return datetime.date(year=value.year - delta, month=1, day=1)
 
 
-class DateHourParameter(_DateParameterBase):
+class _DatetimeParameterBase(Parameter):
+    """
+    Base class Parameter for datetime
+    """
+
+    def __init__(self, interval=1, start=None, **kwargs):
+        super(_DatetimeParameterBase, self).__init__(**kwargs)
+        self.interval = interval
+        self.start = start if start is not None else _UNIX_EPOCH
+
+    @abc.abstractproperty
+    def date_format(self):
+        """
+        Override me with a :py:meth:`~datetime.date.strftime` string.
+        """
+        pass
+
+    @abc.abstractproperty
+    def _timedelta(self):
+        """
+        How to move one interval of this type forward (i.e. not counting self.interval).
+        """
+        pass
+
+    def parse(self, s):
+        """
+        Parses a string to a :py:class:`~datetime.datetime`.
+        """
+        return datetime.datetime.strptime(s, self.date_format)
+
+    def serialize(self, dt):
+        """
+        Converts the date to a string using the :py:attr:`~_DatetimeParameterBase.date_format`.
+        """
+        if dt is None:
+            return str(dt)
+        return dt.strftime(self.date_format)
+
+    def normalize(self, dt):
+        """
+        Clamp dt to every Nth :py:attr:`~_DatetimeParameterBase.interval` starting at
+        :py:attr:`~_DatetimeParameterBase.start`.
+        """
+        if dt is None:
+            return None
+
+        dt = dt.replace(microsecond=0)  # remove microseconds, to avoid float rounding issues.
+        delta = (dt - self.start).total_seconds()
+        granularity = (self._timedelta * self.interval).total_seconds()
+        return dt - datetime.timedelta(seconds=delta % granularity)
+
+    def next_in_enumeration(self, value):
+        return value + self._timedelta * self.interval
+
+
+class DateHourParameter(_DatetimeParameterBase):
     """
     Parameter whose value is a :py:class:`~datetime.datetime` specified to the hour.
 
@@ -348,26 +454,22 @@ class DateHourParameter(_DateParameterBase):
     """
 
     date_format = '%Y-%m-%dT%H'  # ISO 8601 is to use 'T'
-    _timedelta = timedelta(hours=1)
-
-    def parse(self, s):
-        """
-        Parses a string to a :py:class:`~datetime.datetime` using the format string ``%Y-%m-%dT%H``.
-        """
-        return datetime.datetime.strptime(s, self.date_format)
+    _timedelta = datetime.timedelta(hours=1)
 
 
-class DateMinuteParameter(DateHourParameter):
+class DateMinuteParameter(_DatetimeParameterBase):
     """
     Parameter whose value is a :py:class:`~datetime.datetime` specified to the minute.
 
     A DateMinuteParameter is a `ISO 8601 <http://en.wikipedia.org/wiki/ISO_8601>`_ formatted
     date and time specified to the minute. For example, ``2013-07-10T1907`` specifies July 10, 2013 at
     19:07.
+
+    The interval parameter can be used to clamp this parameter to every N minutes, instead of every minute.
     """
 
     date_format = '%Y-%m-%dT%H%M'
-    _timedelta = timedelta(minutes=1)
+    _timedelta = datetime.timedelta(minutes=1)
     deprecated_date_format = '%Y-%m-%dT%HH%M'
 
     def parse(self, s):
@@ -394,8 +496,7 @@ class IntParameter(Parameter):
         """
         return int(s)
 
-    @staticmethod
-    def next_in_enumeration(value):
+    def next_in_enumeration(self, value):
         return value + 1
 
 
@@ -427,6 +528,10 @@ class BoolParameter(Parameter):
         Parses a ``bool`` from the string, matching 'true' or 'false' ignoring case.
         """
         return {'true': True, 'false': False}[str(s).lower()]
+
+    def normalize(self, value):
+        # coerce anything truthy to True
+        return bool(value) if value is not None else None
 
     @staticmethod
     def _parser_action():
@@ -471,8 +576,8 @@ class DateIntervalParameter(Parameter):
             i = cls.parse(s)
             if i:
                 return i
-        else:
-            raise ValueError('Invalid date interval - could not be parsed')
+
+        raise ValueError('Invalid date interval - could not be parsed')
 
 
 class TimeDeltaParameter(Parameter):
@@ -498,11 +603,11 @@ class TimeDeltaParameter(Parameter):
                 has_val = has_val or val != 0
                 kwargs[k] = val
             if has_val:
-                return timedelta(**kwargs)
+                return datetime.timedelta(**kwargs)
 
     def _parseIso8601(self, input):
         def field(key):
-            return "(?P<%s>\d+)%s" % (key, key[0].upper())
+            return r"(?P<%s>\d+)%s" % (key, key[0].upper())
 
         def optional_field(key):
             return "(%s)?" % field(key)
@@ -514,7 +619,7 @@ class TimeDeltaParameter(Parameter):
         keys = ["weeks", "days", "hours", "minutes", "seconds"]
         # Give the digits a regex group name from the keys, then look for text with the first letter of the key,
         # optionally followed by the rest of the word, with final char (the "s") optional
-        regex = "".join(["((?P<%s>\d+) ?%s(%s)?(%s)? ?)?" % (k, k[0], k[1:-1], k[-1]) for k in keys])
+        regex = "".join([r"((?P<%s>\d+) ?%s(%s)?(%s)? ?)?" % (k, k[0], k[1:-1], k[-1]) for k in keys])
         return self._apply_regex(regex, input)
 
     def parse(self, input):
@@ -541,7 +646,7 @@ class TaskParameter(Parameter):
     ``MyMetaTask(my_task_param=my_tasks.MyTask)``. On the command line,
     you specify the :py:attr:`luigi.task.Task.task_family`. Like
 
-    .. code:: console
+    .. code-block:: console
 
             $ luigi --module my_tasks MyMetaTask --my_task_param my_namespace.MyTask
 
@@ -562,3 +667,133 @@ class TaskParameter(Parameter):
         Converts the :py:class:`luigi.task.Task` (sub) class to its family name.
         """
         return cls.task_family
+
+
+class EnumParameter(Parameter):
+    """
+    A parameter whose value is an :class:`~enum.Enum`.
+
+    In the task definition, use
+
+    .. code-block:: python
+
+        class Models(enum.IntEnum):
+          Honda = 1
+
+        class MyTask(luigi.Task):
+          my_param = luigi.EnumParameter(enum=Models)
+
+    At the command line, use,
+
+    .. code-block:: console
+
+        $ luigi --module my_tasks MyTask --my-param Honda
+
+    """
+
+    def __init__(self, *args, **kwargs):
+        if 'enum' not in kwargs:
+            raise ParameterException('An enum class must be specified.')
+        self._enum = kwargs.pop('enum')
+        super(EnumParameter, self).__init__(*args, **kwargs)
+
+    def parse(self, s):
+        try:
+            return self._enum[s]
+        except KeyError:
+            raise ValueError('Invalid enum value - could not be parsed')
+
+    def serialize(self, e):
+        return e.name
+
+
+class FrozenOrderedDict(Mapping):
+    """
+    It is an immutable wrapper around ordered dictionaries that implements the complete :py:class:`collections.Mapping`
+    interface. It can be used as a drop-in replacement for dictionaries where immutability and ordering are desired.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.__dict = OrderedDict(*args, **kwargs)
+        self.__hash = None
+
+    def __getitem__(self, key):
+        return self.__dict[key]
+
+    def __iter__(self):
+        return iter(self.__dict)
+
+    def __len__(self):
+        return len(self.__dict)
+
+    def __repr__(self):
+        return '<FrozenOrderedDict %s>' % repr(self.__dict)
+
+    def __hash__(self):
+        if self.__hash is None:
+            hashes = map(hash, self.items())
+            self.__hash = functools.reduce(operator.xor, hashes, 0)
+
+        return self.__hash
+
+    def get_wrapped(self):
+        return self.__dict
+
+
+class DictParameter(Parameter):
+    """
+    Parameter whose value is a ``dict``.
+
+    In the task definition, use
+
+    .. code-block:: python
+
+        class MyTask(luigi.Task):
+          tags = luigi.DictParameter()
+
+            def run(self):
+                logging.info("Find server with role: %s", self.tags['role'])
+                server = aws.ec2.find_my_resource(self.tags)
+
+
+    At the command line, use
+
+    .. code-block:: console
+
+        $ luigi --module my_tasks MyTask --tags <JSON string>
+
+    Simple example with two tags:
+
+    .. code-block:: console
+
+        $ luigi --module my_tasks MyTask --tags '{"role": "web", "env": "staging"}'
+
+    It can be used to define dynamic parameters, when you do not know the exact list of your parameters (e.g. list of
+    tags, that are dynamically constructed outside Luigi), or you have a complex parameter containing logically related
+    values (like a database connection config).
+    """
+
+    class DictParamEncoder(JSONEncoder):
+        """
+        JSON encoder for :py:class:`~DictParameter`, which makes :py:class:`~FrozenOrderedDict` JSON serializable.
+        """
+        def default(self, obj):
+            if isinstance(obj, FrozenOrderedDict):
+                return obj.get_wrapped()
+            return json.JSONEncoder.default(self, obj)
+
+    def parse(self, s):
+        """
+        Parses an immutable and ordered ``dict`` from a JSON string using standard JSON library.
+
+        We need to use an immutable dictionary, to create a hashable parameter and also preserve the internal structure
+        of parsing. The traversal order of standard ``dict`` is undefined, which can result various string
+        representations of this parameter, and therefore a different task id for the task containing this parameter.
+        This is because task id contains the hash of parameters' JSON representation.
+
+        :param s: String to be parse
+        """
+        return json.loads(s, object_pairs_hook=FrozenOrderedDict)
+
+    def serialize(self, x):
+        return json.dumps(x, cls=DictParameter.DictParamEncoder)

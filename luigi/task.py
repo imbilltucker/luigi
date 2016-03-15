@@ -27,6 +27,9 @@ except ImportError:
 import logging
 import traceback
 import warnings
+import json
+import hashlib
+import re
 
 from luigi import six
 
@@ -35,6 +38,12 @@ from luigi.task_register import Register
 
 Parameter = parameter.Parameter
 logger = logging.getLogger('luigi-interface')
+
+
+TASK_ID_INCLUDE_PARAMS = 3
+TASK_ID_TRUNCATE_PARAMS = 16
+TASK_ID_TRUNCATE_HASH = 10
+TASK_ID_INVALID_CHAR_REGEX = re.compile(r'[^A-Za-z0-9_]')
 
 
 def namespace(namespace=None):
@@ -56,6 +65,26 @@ def namespace(namespace=None):
             task_namespace = 'namespace2'
     """
     Register._default_namespace = namespace
+
+
+def task_id_str(task_family, params):
+    """
+    Returns a canonical string used to identify a particular task
+
+    :param task_family: The task family (class name) of the task
+    :param params: a dict mapping parameter names to their serialized values
+    :return: A unique, shortened identifier corresponding to the family and params
+    """
+    # task_id is a concatenation of task family, the first values of the first 3 parameters
+    # sorted by parameter name and a md5hash of the family/parameters as a cananocalised json.
+    param_str = json.dumps(params, separators=(',', ':'), sort_keys=True)
+    param_hash = hashlib.md5(param_str.encode('utf-8')).hexdigest()
+
+    param_summary = '_'.join(p[:TASK_ID_TRUNCATE_PARAMS]
+                             for p in (params[p] for p in sorted(params)[:TASK_ID_INCLUDE_PARAMS]))
+    param_summary = TASK_ID_INVALID_CHAR_REGEX.sub('_', param_summary)
+
+    return '{}_{}_{}'.format(task_family, param_summary, param_hash[:TASK_ID_TRUNCATE_HASH])
 
 
 class BulkCompleteNotImplementedError(NotImplementedError):
@@ -190,6 +219,10 @@ class Task(object):
         return params
 
     @classmethod
+    def get_param_names(cls, include_significant=False):
+        return [name for name, p in cls.get_params() if include_significant or p.significant]
+
+    @classmethod
     def get_param_values(cls, params, args, kwargs):
         """
         Get the values of the parameters from the args and kwargs.
@@ -215,7 +248,7 @@ class Task(object):
             if i >= len(positional_params):
                 raise parameter.UnknownParameterException('%s: takes at most %d parameters (%d given)' % (exc_desc, len(positional_params), len(args)))
             param_name, param_obj = positional_params[i]
-            result[param_name] = arg
+            result[param_name] = param_obj.normalize(arg)
 
         # Then the keyword arguments
         for param_name, arg in six.iteritems(kwargs):
@@ -223,7 +256,7 @@ class Task(object):
                 raise parameter.DuplicateParameterException('%s: parameter %s was already set as a positional parameter' % (exc_desc, param_name))
             if param_name not in params_dict:
                 raise parameter.UnknownParameterException('%s: unknown parameter %s' % (exc_desc, param_name))
-            result[param_name] = arg
+            result[param_name] = params_dict[param_name].normalize(arg)
 
         # Then use the defaults for anything not filled in
         for param_name, param_obj in params:
@@ -253,14 +286,7 @@ class Task(object):
         self.param_args = tuple(value for key, value in param_values)
         self.param_kwargs = dict(param_values)
 
-        # Build up task id
-        task_id_parts = []
-        param_objs = dict(params)
-        for param_name, param_value in param_values:
-            if param_objs[param_name].significant:
-                task_id_parts.append('%s=%s' % (param_name, param_objs[param_name].serialize(param_value)))
-
-        self.task_id = '%s(%s)' % (self.task_family, ', '.join(task_id_parts))
+        self.task_id = task_id_str(self.task_family, self.to_str_params(only_significant=True))
         self.__hash = hash(self.task_id)
 
     def initialized(self):
@@ -283,14 +309,15 @@ class Task(object):
 
         return cls(**kwargs)
 
-    def to_str_params(self):
+    def to_str_params(self, only_significant=False):
         """
         Convert all parameters to a str->str hash.
         """
         params_str = {}
         params = dict(self.get_params())
         for param_name, param_value in six.iteritems(self.param_kwargs):
-            params_str[param_name] = params[param_name].serialize(param_value)
+            if (not only_significant) or params[param_name].significant:
+                params_str[param_name] = params[param_name].serialize(param_value)
 
         return params_str
 
@@ -324,7 +351,22 @@ class Task(object):
         return self.__hash
 
     def __repr__(self):
-        return self.task_id
+        """
+        Build a task representation like `MyTask(param1=1.5, param2='5')`
+        """
+        params = self.get_params()
+        param_values = self.get_param_values(params, [], self.param_kwargs)
+
+        # Build up task id
+        repr_parts = []
+        param_objs = dict(params)
+        for param_name, param_value in param_values:
+            if param_objs[param_name].significant:
+                repr_parts.append('%s=%s' % (param_name, param_objs[param_name].serialize(param_value)))
+
+        task_str = '{}({})'.format(self.task_family, ', '.join(repr_parts))
+
+        return task_str
 
     def __eq__(self, other):
         return self.__class__ == other.__class__ and self.param_args == other.param_args
@@ -473,7 +515,18 @@ class MixinNaiveBulkComplete(object):
     """
     @classmethod
     def bulk_complete(cls, parameter_tuples):
-        return [t for t in parameter_tuples if cls(t).complete()]
+        generated_tuples = []
+        for parameter_tuple in parameter_tuples:
+            if isinstance(parameter_tuple, (list, tuple)):
+                if cls(*parameter_tuple).complete():
+                    generated_tuples.append(parameter_tuple)
+            elif isinstance(parameter_tuple, dict):
+                if cls(**parameter_tuple).complete():
+                    generated_tuples.append(parameter_tuple)
+            else:
+                if cls(parameter_tuple).complete():
+                    generated_tuples.append(parameter_tuple)
+        return generated_tuples
 
 
 def externalize(task):

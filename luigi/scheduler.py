@@ -26,11 +26,11 @@ try:
     import cPickle as pickle
 except ImportError:
     import pickle
-import datetime
 import functools
 import itertools
 import logging
 import os
+import re
 import time
 
 from luigi import six
@@ -75,10 +75,12 @@ STATUS_TO_UPSTREAM_MAP = {
     DISABLED: UPSTREAM_DISABLED,
 }
 
+TASK_FAMILY_RE = re.compile(r'([^(_]+)[(_]')
+
 
 class scheduler(Config):
-    # TODO(erikbern): the config_path is needed for backwards compatilibity. We should drop the compatibility
-    # at some point (in particular this would force users to replace all dashes with underscores in the config)
+    # TODO(erikbern): the config_path is needed for backwards compatilibity. We
+    # should drop the compatibility at some point
     retry_delay = parameter.FloatParameter(default=900.0)
     remove_delay = parameter.FloatParameter(default=600.0)
     worker_disconnect_delay = parameter.FloatParameter(default=60.0)
@@ -101,15 +103,6 @@ class scheduler(Config):
     record_task_history = parameter.BoolParameter(default=False)
 
     prune_on_get_work = parameter.BoolParameter(default=False)
-
-
-def fix_time(x):
-    # Backwards compatibility for a fix in Dec 2014. Prior to the fix, pickled state might store datetime objects
-    # Let's remove this function soon
-    if isinstance(x, datetime.datetime):
-        return time.mktime(x.timetuple())
-    else:
-        return x
 
 
 class Failures(object):
@@ -147,7 +140,7 @@ class Failures(object):
         """
         min_time = time.time() - self.window
 
-        while self.failures and fix_time(self.failures[0]) < min_time:
+        while self.failures and self.failures[0] < min_time:
             self.failures.popleft()
 
         return len(self.failures)
@@ -180,6 +173,7 @@ class Task(object):
             self.deps = set(deps)
         self.status = status  # PENDING, RUNNING, FAILED or DONE
         self.time = time.time()  # Timestamp when task was first added
+        self.updated = self.time
         self.retry = None
         self.remove = None
         self.worker_running = None  # the worker id that is currently running the task or None
@@ -219,6 +213,11 @@ class Task(object):
         return (self.disable_failures is not None or
                 self.disable_hard_timeout is not None)
 
+    @property
+    def pretty_id(self):
+        param_str = ', '.join('{}={}'.format(key, value) for key, value in self.params.items())
+        return '{}({})'.format(self.family, param_str)
+
 
 class Worker(object):
     """
@@ -233,6 +232,7 @@ class Worker(object):
         self.started = time.time()  # seconds since epoch
         self.tasks = set()  # task objects
         self.info = {}
+        self.disabled = False
 
     def add_info(self, info):
         self.info.update(info)
@@ -325,30 +325,6 @@ class SimpleTaskState(object):
             self._status_tasks = collections.defaultdict(dict)
             for task in six.itervalues(self._tasks):
                 self._status_tasks[task.status][task.id] = task
-
-            # Convert from old format
-            # TODO: this is really ugly, we need something more future-proof
-            # Every time we add an attribute to the Worker or Task class, this
-            # code needs to be updated
-
-            # Compatibility since 2014-06-02
-            for k, v in six.iteritems(self._active_workers):
-                if isinstance(v, float):
-                    self._active_workers[k] = Worker(worker_id=k, last_active=v)
-
-            # Compatibility since 2015-05-28
-            if any(not hasattr(w, 'tasks') for k, w in six.iteritems(self._active_workers)):
-                # If you load from an old format where Workers don't contain tasks.
-                for k, worker in six.iteritems(self._active_workers):
-                    worker.tasks = set()
-                for task in six.itervalues(self._tasks):
-                    for worker_id in task.workers:
-                        self._active_workers[worker_id].tasks.add(task)
-
-            # Compatibility since 2015-04-28
-            if any(not hasattr(t, 'disable_hard_timeout') for t in six.itervalues(self._tasks)):
-                for t in six.itervalues(self._tasks):
-                    t.disable_hard_timeout = None
         else:
             logger.info("No prior state file exists at %s. Starting with clean slate", self._state_path)
 
@@ -423,9 +399,11 @@ class SimpleTaskState(object):
         elif new_status == DISABLED:
             task.scheduler_disable_time = None
 
-        self._status_tasks[task.status].pop(task.id)
-        self._status_tasks[new_status][task.id] = task
-        task.status = new_status
+        if new_status != task.status:
+            self._status_tasks[task.status].pop(task.id)
+            self._status_tasks[new_status][task.id] = task
+            task.status = new_status
+            task.updated = time.time()
 
     def fail_dead_worker_task(self, task, config, assistants):
         # If a running worker disconnects, tag all its jobs as FAILED and subject it to the same retry logic
@@ -449,7 +427,7 @@ class SimpleTaskState(object):
 
         # Re-enable task after the disable time expires
         if task.status == DISABLED and task.scheduler_disable_time is not None:
-            if time.time() - fix_time(task.scheduler_disable_time) > config.disable_persist:
+            if time.time() - task.scheduler_disable_time > config.disable_persist:
                 self.re_enable(task, config)
 
         # Remove tasks that have no stakeholders
@@ -494,11 +472,18 @@ class SimpleTaskState(object):
         # Mark workers as inactive
         for worker in delete_workers:
             self._active_workers.pop(worker)
+        self._remove_workers_from_tasks(delete_workers)
 
-        # remove workers from tasks
+    def _remove_workers_from_tasks(self, workers, remove_stakeholders=True):
         for task in self.get_active_tasks():
-            task.stakeholders.difference_update(delete_workers)
-            task.workers.difference_update(delete_workers)
+            if remove_stakeholders:
+                task.stakeholders.difference_update(workers)
+            task.workers.difference_update(workers)
+
+    def disable_workers(self, workers):
+        self._remove_workers_from_tasks(workers, remove_stakeholders=False)
+        for worker in workers:
+            self.get_worker(worker).disabled = True
 
     def get_necessary_tasks(self):
         necessary_tasks = set()
@@ -567,7 +552,8 @@ class CentralPlannerScheduler(Scheduler):
 
         for task in self._state.get_active_tasks():
             self._state.fail_dead_worker_task(task, self._config, assistant_ids)
-            if task.id not in necessary_tasks and self._state.prune(task, self._config):
+            removed = self._state.prune(task, self._config)
+            if removed and task.id not in necessary_tasks:
                 remove_tasks.append(task.id)
 
         self._state.inactivate_tasks(remove_tasks)
@@ -580,6 +566,7 @@ class CentralPlannerScheduler(Scheduler):
         """
         worker = self._state.get_worker(worker_id)
         worker.update(worker_reference, get_work=get_work)
+        return not getattr(worker, 'disabled', False)
 
     def _update_priority(self, task, prio, worker):
         """
@@ -606,11 +593,20 @@ class CentralPlannerScheduler(Scheduler):
         * update priority when needed
         """
         worker_id = kwargs['worker']
-        self.update(worker_id)
+        worker_enabled = self.update(worker_id)
 
-        task = self._state.get_task(task_id, setdefault=self._make_task(
-            task_id=task_id, status=PENDING, deps=deps, resources=resources,
-            priority=priority, family=family, module=module, params=params))
+        if worker_enabled:
+            _default_task = self._make_task(
+                task_id=task_id, status=PENDING, deps=deps, resources=resources,
+                priority=priority, family=family, module=module, params=params,
+            )
+        else:
+            _default_task = None
+
+        task = self._state.get_task(task_id, setdefault=_default_task)
+
+        if task is None or (task.status != RUNNING and not worker_enabled):
+            return
 
         # for setting priority, we'll sometimes create tasks with unset family and params
         if not task.family:
@@ -649,7 +645,7 @@ class CentralPlannerScheduler(Scheduler):
         if resources is not None:
             task.resources = resources
 
-        if not assistant:
+        if worker_enabled and not assistant:
             task.stakeholders.add(worker_id)
 
             # Task dependencies might not exist yet. Let's create dummy tasks for them for now.
@@ -660,13 +656,16 @@ class CentralPlannerScheduler(Scheduler):
 
         self._update_priority(task, priority, worker_id)
 
-        if runnable:
+        if runnable and status != FAILED and worker_enabled:
             task.workers.add(worker_id)
             self._state.get_worker(worker_id).tasks.add(task)
             task.runnable = runnable
 
     def add_worker(self, worker, info, **kwargs):
         self._state.get_worker(worker).add_info(info)
+
+    def disable_worker(self, worker):
+        self._state.disable_workers({worker})
 
     def update_resources(self, **resources):
         if self._resources is None:
@@ -686,8 +685,8 @@ class CentralPlannerScheduler(Scheduler):
     def _used_resources(self):
         used_resources = collections.defaultdict(int)
         if self._resources is not None:
-            for task in self._state.get_active_tasks():
-                if task.status == RUNNING and task.resources:
+            for task in self._state.get_active_tasks(status=RUNNING):
+                if task.resources:
                     for resource, amount in six.iteritems(task.resources):
                         used_resources[resource] += amount
         return used_resources
@@ -766,7 +765,6 @@ class CentralPlannerScheduler(Scheduler):
         tasks.sort(key=self._rank, reverse=True)
 
         for task in tasks:
-            upstream_status = self._upstream_status(task.id, upstream_table)
             in_workers = (assistant and getattr(task, 'runnable', bool(task.workers))) or worker_id in task.workers
             if task.status == RUNNING and in_workers:
                 # Return a list of currently running tasks to the client,
@@ -777,10 +775,12 @@ class CentralPlannerScheduler(Scheduler):
                     more_info.update(other_worker.info)
                     running_tasks.append(more_info)
 
-            if task.status == PENDING and in_workers and upstream_status != UPSTREAM_DISABLED:
-                locally_pending_tasks += 1
-                if len(task.workers) == 1 and not assistant:
-                    n_unique_pending += 1
+            if task.status == PENDING and in_workers:
+                upstream_status = self._upstream_status(task.id, upstream_table)
+                if upstream_status != UPSTREAM_DISABLED:
+                    locally_pending_tasks += 1
+                    if len(task.workers) == 1 and not assistant:
+                        n_unique_pending += 1
 
             if best_task:
                 continue
@@ -836,13 +836,13 @@ class CentralPlannerScheduler(Scheduler):
 
             while task_stack:
                 dep_id = task_stack.pop()
-                if self._state.has_task(dep_id):
-                    dep = self._state.get_task(dep_id)
+                dep = self._state.get_task(dep_id)
+                if dep:
                     if dep.status == DONE:
                         continue
                     if dep_id not in upstream_status_table:
                         if dep.status == PENDING and dep.deps:
-                            task_stack = task_stack + [dep_id] + list(dep.deps)
+                            task_stack += [dep_id] + list(dep.deps)
                             upstream_status_table[dep_id] = ''  # will be updated postorder
                         else:
                             dep_status = STATUS_TO_UPSTREAM_MAP.get(dep.status, '')
@@ -850,20 +850,22 @@ class CentralPlannerScheduler(Scheduler):
                     elif upstream_status_table[dep_id] == '' and dep.deps:
                         # This is the postorder update step when we set the
                         # status based on the previously calculated child elements
-                        upstream_status = [upstream_status_table.get(a_task_id, '') for a_task_id in dep.deps]
-                        upstream_status.append('')  # to handle empty list
-                        status = max(upstream_status, key=UPSTREAM_SEVERITY_KEY)
+                        status = max((upstream_status_table.get(a_task_id, '')
+                                      for a_task_id in dep.deps),
+                                     key=UPSTREAM_SEVERITY_KEY)
                         upstream_status_table[dep_id] = status
             return upstream_status_table[dep_id]
 
     def _serialize_task(self, task_id, include_deps=True, deps=None):
         task = self._state.get_task(task_id)
         ret = {
+            'display_name': task.pretty_id,
             'status': task.status,
             'workers': list(task.workers),
             'worker_running': task.worker_running,
             'time_running': getattr(task, "time_running", None),
             'start_time': task.time,
+            'last_updated': getattr(task, "updated", task.time),
             'params': task.params,
             'name': task.family,
             'priority': task.priority,
@@ -884,7 +886,13 @@ class CentralPlannerScheduler(Scheduler):
             serialized.update(self._traverse_graph(task.id, seen))
         return serialized
 
-    def _traverse_graph(self, root_task_id, seen=None, dep_func=None):
+    def _filter_done(self, task_ids):
+        for task_id in task_ids:
+            task = self._state.get_task(task_id)
+            if task is None or task.status != DONE:
+                yield task_id
+
+    def _traverse_graph(self, root_task_id, seen=None, dep_func=None, include_done=True):
         """ Returns the dependency graph rooted at task_id
 
         This does a breadth-first traversal to find the nodes closest to the
@@ -900,7 +908,8 @@ class CentralPlannerScheduler(Scheduler):
             return {}
 
         if dep_func is None:
-            dep_func = lambda t: t.deps
+            def dep_func(t):
+                return t.deps
 
         seen.add(root_task_id)
         serialized = {}
@@ -912,12 +921,11 @@ class CentralPlannerScheduler(Scheduler):
             if task is None or not task.family:
                 logger.warn('Missing task for id [%s]', task_id)
 
-                # try to infer family and params from task_id
-                try:
-                    family, _, param_str = task_id.rstrip(')').partition('(')
-                    params = dict(param.split('=') for param in param_str.split(', '))
-                except BaseException:
-                    family, params = '', {}
+                # NOTE : If a dependency is missing from self._state there is no way to deduce the
+                #        task family and parameters.
+                family_match = TASK_FAMILY_RE.match(task_id)
+                family = family_match.group(1) if family_match else UNKNOWN
+                params = {'task_id': task_id}
                 serialized[task_id] = {
                     'deps': [],
                     'status': UNKNOWN,
@@ -925,27 +933,33 @@ class CentralPlannerScheduler(Scheduler):
                     'start_time': UNKNOWN,
                     'params': params,
                     'name': family,
+                    'display_name': task_id,
                     'priority': 0,
                 }
             else:
                 deps = dep_func(task)
+                if not include_done:
+                    deps = list(self._filter_done(deps))
                 serialized[task_id] = self._serialize_task(task_id, deps=deps)
                 for dep in sorted(deps):
                     if dep not in seen:
                         seen.add(dep)
                         queue.append(dep)
+
+            if task_id != root_task_id:
+                del serialized[task_id]['display_name']
             if len(serialized) >= self._config.max_graph_nodes:
                 break
 
         return serialized
 
-    def dep_graph(self, task_id, **kwargs):
+    def dep_graph(self, task_id, include_done=True, **kwargs):
         self.prune()
         if not self._state.has_task(task_id):
             return {}
-        return self._traverse_graph(task_id)
+        return self._traverse_graph(task_id, include_done=include_done)
 
-    def inverse_dep_graph(self, task_id, **kwargs):
+    def inverse_dep_graph(self, task_id, include_done=True, **kwargs):
         self.prune()
         if not self._state.has_task(task_id):
             return {}
@@ -953,7 +967,8 @@ class CentralPlannerScheduler(Scheduler):
         for task in self._state.get_active_tasks():
             for dep in task.deps:
                 inverse_graph[dep].add(task.id)
-        return self._traverse_graph(task_id, dep_func=lambda t: inverse_graph[t.id])
+        return self._traverse_graph(
+            task_id, dep_func=lambda t: inverse_graph[t.id], include_done=include_done)
 
     def task_list(self, status, upstream_status, limit=True, search=None, **kwargs):
         """
@@ -963,10 +978,13 @@ class CentralPlannerScheduler(Scheduler):
         result = {}
         upstream_status_table = {}  # used to memoize upstream status
         if search is None:
-            filter_func = lambda _: True
+            def filter_func(_):
+                return True
         else:
             terms = search.split()
-            filter_func = lambda t: all(term in t.id for term in terms)
+
+            def filter_func(t):
+                return all(term in t.pretty_id for term in terms)
         for task in filter(filter_func, self._state.get_active_tasks(status)):
             if (task.status != PENDING or not upstream_status or
                     upstream_status == self._upstream_status(task.id, upstream_status_table)):
@@ -976,6 +994,13 @@ class CentralPlannerScheduler(Scheduler):
             return {'num_tasks': len(result)}
         return result
 
+    def _first_task_display_name(self, worker):
+        task_id = worker.info.get('first_task', '')
+        if self._state.has_task(task_id):
+            return self._state.get_task(task_id).pretty_id
+        else:
+            return task_id
+
     def worker_list(self, include_running=True, **kwargs):
         self.prune()
         workers = [
@@ -983,6 +1008,7 @@ class CentralPlannerScheduler(Scheduler):
                 name=worker.id,
                 last_active=worker.last_active,
                 started=getattr(worker, 'started', None),
+                first_task_display_name=self._first_task_display_name(worker),
                 **worker.info
             ) for worker in self._state.get_active_workers()]
         workers.sort(key=lambda worker: worker['started'], reverse=True)
@@ -1005,6 +1031,41 @@ class CentralPlannerScheduler(Scheduler):
                 worker['num_uniques'] = num_uniques[worker['name']]
                 worker['running'] = tasks
         return workers
+
+    def resource_list(self):
+        """
+        Resources usage info and their consumers (tasks).
+        """
+        self.prune()
+        resources = [
+            dict(
+                name=resource,
+                num_total=r_dict['total'],
+                num_used=r_dict['used']
+            ) for resource, r_dict in six.iteritems(self.resources())]
+        if self._resources is not None:
+            consumers = collections.defaultdict(dict)
+            for task in self._state.get_running_tasks():
+                if task.status == RUNNING and task.resources:
+                    for resource, amount in six.iteritems(task.resources):
+                        consumers[resource][task.id] = self._serialize_task(task.id, False)
+            for resource in resources:
+                tasks = consumers[resource['name']]
+                resource['num_consumer'] = len(tasks)
+                resource['running'] = tasks
+        return resources
+
+    def resources(self):
+        ''' get total resources and available ones '''
+        used_resources = self._used_resources()
+        ret = collections.defaultdict(dict)
+        for resource, total in six.iteritems(self._resources):
+            ret[resource]['total'] = total
+            if resource in used_resources:
+                ret[resource]['used'] = used_resources[resource]
+            else:
+                ret[resource]['used'] = 0
+        return ret
 
     def task_search(self, task_str, **kwargs):
         """
@@ -1031,7 +1092,8 @@ class CentralPlannerScheduler(Scheduler):
 
     def fetch_error(self, task_id, **kwargs):
         if self._state.has_task(task_id):
-            return {"taskId": task_id, "error": self._state.get_task(task_id).expl}
+            task = self._state.get_task(task_id)
+            return {"taskId": task_id, "error": task.expl, 'displayName': task.pretty_id}
         else:
             return {"taskId": task_id, "error": ""}
 

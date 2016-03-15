@@ -75,6 +75,12 @@ class SchedulerTest(unittest.TestCase):
         cps = luigi.scheduler.CentralPlannerScheduler()
         self.assertEqual({'a': 100, 'b': 200}, cps._resources)
 
+    @with_config({'scheduler': {'record_task_history': 'True'},
+                  'task_history': {'db_connection': 'sqlite:////none/existing/path/hist.db'}})
+    def test_local_scheduler_task_history_status(self):
+        ls = luigi.interface._WorkerSchedulerFactory().create_local_scheduler()
+        self.assertEqual(False, ls._config.record_task_history)
+
     def test_load_recovers_tasks_index(self):
         cps = luigi.scheduler.CentralPlannerScheduler()
         cps.add_task(worker='A', task_id='1')
@@ -91,11 +97,10 @@ class SchedulerTest(unittest.TestCase):
                 cps._state._state_path = fn.name
                 cps.load()
                 return cps
-            del cps._state.get_worker('B').tasks  # If you upgrade from old server
-            cps = reload_from_disk(cps=cps)  # tihii, cps == continuation passing style ;)
+            cps = reload_from_disk(cps=cps)
             self.assertEqual(cps.get_work(worker='B')['task_id'], '2')
             self.assertEqual(cps.get_work(worker='C')['task_id'], '3')
-            cps = reload_from_disk(cps=cps)  # This time without deleting
+            cps = reload_from_disk(cps=cps)
             self.assertEqual(cps.get_work(worker='D')['task_id'], '4')
 
     def test_worker_prune_after_init(self):
