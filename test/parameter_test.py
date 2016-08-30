@@ -285,6 +285,28 @@ class ParameterTest(LuigiTestCase):
         b_tuple = ((1, 2), (3, 4))
         self.assertEqual(b_tuple, a.parse(a.serialize(b_tuple)))
 
+    def test_parse_list_without_batch_method(self):
+        param = luigi.Parameter()
+        for xs in [], ['x'], ['x', 'y']:
+            self.assertRaises(NotImplementedError, param._parse_list, xs)
+
+    def test_parse_empty_list_raises_value_error(self):
+        for batch_method in (max, min, tuple, ','.join):
+            param = luigi.Parameter(batch_method=batch_method)
+            self.assertRaises(ValueError, param._parse_list, [])
+
+    def test_parse_int_list_max(self):
+        param = luigi.IntParameter(batch_method=max)
+        self.assertEqual(17, param._parse_list(['7', '17', '5']))
+
+    def test_parse_string_list_max(self):
+        param = luigi.Parameter(batch_method=max)
+        self.assertEqual('7', param._parse_list(['7', '17', '5']))
+
+    def test_parse_list_as_tuple(self):
+        param = luigi.IntParameter(batch_method=tuple)
+        self.assertEqual((7, 17, 5), param._parse_list(['7', '17', '5']))
+
 
 class TestParametersHashability(LuigiTestCase):
     def test_date(self):
@@ -542,6 +564,16 @@ class TestParamWithDefaultFromConfig(LuigiTestCase):
     def testDateMinuteDeprecated(self):
         p = luigi.DateMinuteParameter(config_path=dict(section="foo", name="bar"))
         self.assertEqual(datetime.datetime(2001, 2, 3, 4, 30, 0), _value(p))
+
+    @with_config({"foo": {"bar": "2001-02-03T040506"}})
+    def testDateSecond(self):
+        p = luigi.DateSecondParameter(config_path=dict(section="foo", name="bar"))
+        self.assertEqual(datetime.datetime(2001, 2, 3, 4, 5, 6), _value(p))
+
+    @with_config({"foo": {"bar": "2001-02-03T040507"}})
+    def testDateSecondWithInterval(self):
+        p = luigi.DateSecondParameter(config_path=dict(section="foo", name="bar"), interval=2)
+        self.assertEqual(datetime.datetime(2001, 2, 3, 4, 5, 6), _value(p))
 
     @with_config({"foo": {"bar": "2001-02-03"}})
     def testDate(self):
@@ -823,6 +855,16 @@ class TestParamWithDefaultFromConfig(LuigiTestCase):
     @with_config({"foo": {"bar": "((1,2),(3,4))"}})
     def testTupleConfig(self):
         self.assertTrue(_value(luigi.TupleParameter(config_path=dict(section="foo", name="bar"))))
+
+    @with_config({"foo": {"bar": "-3"}})
+    def testNumericalParameter(self):
+        p = luigi.NumericalParameter(min_value=-3, max_value=7, var_type=int, config_path=dict(section="foo", name="bar"))
+        self.assertEqual(-3, _value(p))
+
+    @with_config({"foo": {"bar": "3"}})
+    def testChoiceParameter(self):
+        p = luigi.ChoiceParameter(var_type=int, choices=[1, 2, 3], config_path=dict(section="foo", name="bar"))
+        self.assertEqual(3, _value(p))
 
 
 class OverrideEnvStuff(LuigiTestCase):
